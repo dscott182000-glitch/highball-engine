@@ -1,0 +1,304 @@
+Subject: [PATCH] win32u: Answer D3DKMT queries for the display driver version.
+
+KMTQAITYPE_QUERYREGISTRY (48) and KMTQAITYPE_UMD_DRIVER_VERSION (18) were
+"type %d not handled" (STATUS_NOT_IMPLEMENTED) in NtGdiDdDDIQueryAdapterInfo.
+
+  * 48 (QUERYREGISTRY): D3DDDI_QUERYREGISTRY_INFO; the "DriverVersion" value of the
+    service/adapter key is answered as REG_SZ "a.b.c.d" or REG_QWORD, with
+    BUFFER_OVERFLOW/OutputValueSize when the caller's buffer is too small. Other
+    values report D3DDDI_QUERYREGISTRY_STATUS_FAIL (and a FIXME).
+  * 18 (UMD_DRIVER_VERSION): D3DKMT_UMD_DRIVER_VERSION, packed a.b.c.d.
+
+The version defaults to 32.0.15.6094 (NVIDIA 560.94); edit D3DKMT_DRIVER_VERSION_*
+in dlls/win32u/d3dkmt.c or set WINE_D3DKMT_DRIVER_VERSION=a.b.c.d at run time.
+Adds the structures to include/ddk/d3dkmthk.h and tests to win32u/tests/d3dkmt.c.
+Applies on CrossOver 26.3.0 sources (sources/wine) with or without
+highball-engine patches 0001-0028 (series is independent: touches no same files).
+
+---
+diff -ruN a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+--- a/dlls/win32u/d3dkmt.c	2026-11-02 19:10:32.575263036 -0600
++++ b/dlls/win32u/d3dkmt.c	2026-11-02 19:10:32.575263036 -0600
+@@ -680,6 +680,106 @@
+     return STATUS_SUCCESS;
+ }
+ 
++/* Driver version reported to D3DKMTQueryAdapterInfo callers (KMTQAITYPE_UMD_DRIVER_VERSION and
++ * the "DriverVersion" value of KMTQAITYPE_QUERYREGISTRY), as the four fields a.b.c.d of a Windows
++ * display driver version.  The default is the Windows driver version of NVIDIA release 560.94
++ * (32.0.15.6094; Windows encodes NVIDIA's "xxx.yy" release as 32.0.15.xxyy).
++ * To change it at build time edit the defaults below; at run time set the environment variable
++ * WINE_D3DKMT_DRIVER_VERSION=a.b.c.d (e.g. 32.0.15.8180). */
++#define D3DKMT_DRIVER_VERSION_A 32
++#define D3DKMT_DRIVER_VERSION_B 0
++#define D3DKMT_DRIVER_VERSION_C 15
++#define D3DKMT_DRIVER_VERSION_D 6094
++
++static void get_d3dkmt_driver_version( UINT16 parts[4] )
++{
++    const char *env = getenv( "WINE_D3DKMT_DRIVER_VERSION" );
++    unsigned int a, b, c, d;
++    char extra;
++
++    parts[0] = D3DKMT_DRIVER_VERSION_A;
++    parts[1] = D3DKMT_DRIVER_VERSION_B;
++    parts[2] = D3DKMT_DRIVER_VERSION_C;
++    parts[3] = D3DKMT_DRIVER_VERSION_D;
++
++    if (!env) return;
++    if (sscanf( env, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra ) != 4 || a > 0xffff || b > 0xffff || c > 0xffff || d > 0xffff)
++    {
++        WARN( "Ignoring invalid WINE_D3DKMT_DRIVER_VERSION %s.\n", debugstr_a(env) );
++        return;
++    }
++    parts[0] = a;
++    parts[1] = b;
++    parts[2] = c;
++    parts[3] = d;
++}
++
++static UINT64 get_d3dkmt_driver_version_packed(void)
++{
++    UINT16 v[4];
++    get_d3dkmt_driver_version( v );
++    return ((UINT64)v[0] << 48) | ((UINT64)v[1] << 32) | ((UINT64)v[2] << 16) | v[3];
++}
++
++static NTSTATUS d3dkmt_query_registry( D3DKMT_QUERYADAPTERINFO *desc )
++{
++    static const WCHAR driver_versionW[] =
++        { 'D','r','i','v','e','r','V','e','r','s','i','o','n',0 };
++    D3DDDI_QUERYREGISTRY_INFO *info = desc->pPrivateDriverData;
++    const UINT output_offset = offsetof( D3DDDI_QUERYREGISTRY_INFO, OutputDword );
++    UINT size = desc->PrivateDriverDataSize, needed;
++    UINT16 v[4];
++    WCHAR str[32];
++    char buf[32];
++    UINT len, i;
++
++    /* Status is the last field before the output, nothing can be reported without it. */
++    if (size < output_offset) return STATUS_INVALID_PARAMETER;
++    if (size < sizeof(*info))
++    {
++        info->Status = D3DDDI_QUERYREGISTRY_STATUS_FAIL;
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    if ((info->QueryType != D3DDDI_QUERYREGISTRY_SERVICEKEY && info->QueryType != D3DDDI_QUERYREGISTRY_ADAPTERKEY) ||
++        info->ValueName[ARRAY_SIZE(info->ValueName) - 1] ||
++        wcsicmp( info->ValueName, driver_versionW ))
++    {
++        FIXME( "QUERYREGISTRY type %d value %s not handled.\n", info->QueryType, debugstr_w( info->ValueName ) );
++        info->Status = D3DDDI_QUERYREGISTRY_STATUS_FAIL;
++        return STATUS_SUCCESS;
++    }
++
++    get_d3dkmt_driver_version( v );
++    switch (info->ValueType)
++    {
++    case REG_SZ:
++        len = snprintf( buf, sizeof(buf), "%u.%u.%u.%u", v[0], v[1], v[2], v[3] );
++        for (i = 0; i <= len; i++) str[i] = buf[i];
++        needed = (len + 1) * sizeof(WCHAR);
++        break;
++    case REG_QWORD:
++        needed = sizeof(UINT64);
++        break;
++    default:
++        FIXME( "DriverVersion with value type %u not handled.\n", (unsigned int)info->ValueType );
++        info->Status = D3DDDI_QUERYREGISTRY_STATUS_FAIL;
++        return STATUS_SUCCESS;
++    }
++
++    info->OutputValueSize = needed;
++    if (size - output_offset < needed)
++    {
++        info->Status = D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW;
++        return STATUS_SUCCESS;
++    }
++
++    if (info->ValueType == REG_SZ) memcpy( info->OutputString, str, needed );
++    else info->OutputQword = get_d3dkmt_driver_version_packed();
++    info->Status = D3DDDI_QUERYREGISTRY_STATUS_SUCCESS;
++    return STATUS_SUCCESS;
++}
++
+ /******************************************************************************
+  *           NtGdiDdDDIQueryAdapterInfo    (win32u.@)
+  */
+@@ -712,6 +812,18 @@
+         *value = KMT_DRIVERVERSION_WDDM_1_3;
+         return STATUS_SUCCESS;
+     }
++    case KMTQAITYPE_UMD_DRIVER_VERSION:
++    {
++        D3DKMT_UMD_DRIVER_VERSION *value = desc->pPrivateDriverData;
++
++        if (desc->PrivateDriverDataSize < sizeof(*value))
++            return STATUS_INVALID_PARAMETER;
++
++        value->DriverVersion.QuadPart = get_d3dkmt_driver_version_packed();
++        return STATUS_SUCCESS;
++    }
++    case KMTQAITYPE_QUERYREGISTRY:
++        return d3dkmt_query_registry( desc );
+     /* CW HACK 24905 */
+     case KMTQAITYPE_WDDM_2_7_CAPS:
+     {
+diff -ruN a/dlls/win32u/tests/d3dkmt.c b/dlls/win32u/tests/d3dkmt.c
+--- a/dlls/win32u/tests/d3dkmt.c	2026-11-02 19:10:32.579262990 -0600
++++ b/dlls/win32u/tests/d3dkmt.c	2026-11-02 19:10:32.579262990 -0600
+@@ -1565,7 +1565,7 @@
+     D3DKMT_QUERYADAPTERINFO query_adapter_info;
+     D3DKMT_CLOSEADAPTER close_adapter_desc;
+     D3DKMT_HANDLE next_local = 0;
+-    unsigned char buffer[1024];
++    DECLSPEC_ALIGN(8) unsigned char buffer[1024];
+     NTSTATUS status;
+     unsigned int i;
+     BOOL ret;
+@@ -1579,6 +1579,7 @@
+     {
+         {KMTQAITYPE_CHECKDRIVERUPDATESTATUS, sizeof(BOOL)},
+         {KMTQAITYPE_DRIVERVERSION, sizeof(D3DKMT_DRIVERVERSION)},
++        {KMTQAITYPE_UMD_DRIVER_VERSION, sizeof(D3DKMT_UMD_DRIVER_VERSION)},
+     };
+ 
+     ret = get_primary_adapter_name( open_adapter_desc.DeviceName );
+@@ -1630,6 +1631,13 @@
+             ok( *value >= KMT_DRIVERVERSION_WDDM_1_3, "Expected %d >= %d.\n", *value, KMT_DRIVERVERSION_WDDM_1_3 );
+             break;
+         }
++        case KMTQAITYPE_UMD_DRIVER_VERSION:
++        {
++            D3DKMT_UMD_DRIVER_VERSION *value = query_adapter_info.pPrivateDriverData;
++            ok( value->DriverVersion.QuadPart >> 48, "Got unexpected driver version %#I64x.\n",
++                value->DriverVersion.QuadPart );
++            break;
++        }
+         default:
+             ok( 0, "Type %d is not handled.\n", tests[i].type );
+             break;
+@@ -1638,6 +1646,51 @@
+         winetest_pop_context();
+     }
+ 
++    /* KMTQAITYPE_QUERYREGISTRY, "DriverVersion" value of the adapter key */
++    {
++        static const WCHAR driver_versionW[] = L"DriverVersion";
++        D3DDDI_QUERYREGISTRY_INFO *info = (D3DDDI_QUERYREGISTRY_INFO *)buffer;
++        UINT a, b, c, d, len;
++        char version[64];
++
++        memset( buffer, 0, sizeof(buffer) );
++        info->QueryType = D3DDDI_QUERYREGISTRY_ADAPTERKEY;
++        info->ValueType = REG_SZ;
++        lstrcpyW( info->ValueName, driver_versionW );
++        query_adapter_info.hAdapter = open_adapter_desc.hAdapter;
++        query_adapter_info.Type = KMTQAITYPE_QUERYREGISTRY;
++        query_adapter_info.pPrivateDriverData = buffer;
++        query_adapter_info.PrivateDriverDataSize = sizeof(buffer);
++        status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++        ok( status == STATUS_SUCCESS || broken( status == STATUS_INVALID_PARAMETER ) /* some Windows */,
++            "Got unexpected return code %#lx.\n", status );
++
++        if (status == STATUS_SUCCESS && info->Status == D3DDDI_QUERYREGISTRY_STATUS_SUCCESS)
++        {
++            ok( info->OutputValueSize == (wcslen( info->OutputString ) + 1) * sizeof(WCHAR),
++                "Got unexpected size %lu.\n", info->OutputValueSize );
++            len = WideCharToMultiByte( CP_ACP, 0, info->OutputString, -1, version, sizeof(version), NULL, NULL );
++            ok( len && sscanf( version, "%u.%u.%u.%u", &a, &b, &c, &d ) == 4,
++                "Got unexpected driver version %s.\n", debugstr_w( info->OutputString ) );
++
++            /* Too small an output buffer reports the required size */
++            memset( buffer, 0, sizeof(buffer) );
++            info->QueryType = D3DDDI_QUERYREGISTRY_ADAPTERKEY;
++            info->ValueType = REG_SZ;
++            lstrcpyW( info->ValueName, driver_versionW );
++            query_adapter_info.PrivateDriverDataSize = sizeof(*info);
++            status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++            ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++            ok( info->Status == D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW ||
++                info->Status == D3DDDI_QUERYREGISTRY_STATUS_SUCCESS, "Got unexpected status %u.\n", info->Status );
++        }
++
++        /* Buffer smaller than the fixed part of the structure */
++        query_adapter_info.PrivateDriverDataSize = 16;
++        status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++        ok( status == STATUS_INVALID_PARAMETER, "Got unexpected return code %#lx.\n", status );
++    }
++
+     close_adapter_desc.hAdapter = open_adapter_desc.hAdapter;
+     status = D3DKMTCloseAdapter( &close_adapter_desc );
+     ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
+diff -ruN a/include/ddk/d3dkmthk.h b/include/ddk/d3dkmthk.h
+--- a/include/ddk/d3dkmthk.h	2026-11-02 19:10:32.575263036 -0600
++++ b/include/ddk/d3dkmthk.h	2026-11-02 19:10:32.575263036 -0600
+@@ -288,6 +288,67 @@
+     UINT                    PrivateDriverDataSize;
+ } D3DKMT_QUERYADAPTERINFO;
+ 
++/* KMTQAITYPE_UMD_DRIVER_VERSION (18), see
++ * https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmthk/ns-d3dkmthk-_d3dkmt_umd_driver_version
++ * DriverVersion packs a.b.c.d as (a << 48) | (b << 32) | (c << 16) | d. */
++typedef struct _D3DKMT_UMD_DRIVER_VERSION
++{
++    DECLSPEC_ALIGN(8) LARGE_INTEGER DriverVersion;
++} D3DKMT_UMD_DRIVER_VERSION;
++
++/* KMTQAITYPE_QUERYREGISTRY (48), see
++ * https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dukmdt/ns-d3dukmdt-_d3dddi_queryregistry_info
++ * The Microsoft documentation of the enum names D3DKMT_ADAPTERREGISTRYINFO for this type, but
++ * the GPU paravirtualization documentation (and the WDDM 2.4 headers) use D3DDDI_QUERYREGISTRY_INFO. */
++typedef enum _D3DDDI_QUERYREGISTRY_TYPE
++{
++    D3DDDI_QUERYREGISTRY_SERVICEKEY,
++    D3DDDI_QUERYREGISTRY_ADAPTERKEY,
++    D3DDDI_QUERYREGISTRY_DRIVERSTOREPATH,
++    D3DDDI_QUERYREGISTRY_DRIVERIMAGEPATH,
++    D3DDDI_QUERYREGISTRY_MAX,
++} D3DDDI_QUERYREGISTRY_TYPE;
++
++typedef enum _D3DDDI_QUERYREGISTRY_STATUS
++{
++    D3DDDI_QUERYREGISTRY_STATUS_SUCCESS,
++    D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW,
++    D3DDDI_QUERYREGISTRY_STATUS_FAIL,
++    D3DDDI_QUERYREGISTRY_STATUS_MAX,
++} D3DDDI_QUERYREGISTRY_STATUS;
++
++typedef struct _D3DDDI_QUERYREGISTRY_FLAGS
++{
++    union
++    {
++        struct
++        {
++            UINT TranslatePath : 1;
++            UINT MutableValue : 1;
++            UINT Reserved : 30;
++        };
++        UINT Value;
++    };
++} D3DDDI_QUERYREGISTRY_FLAGS;
++
++typedef struct _D3DDDI_QUERYREGISTRY_INFO
++{
++    D3DDDI_QUERYREGISTRY_TYPE   QueryType;
++    D3DDDI_QUERYREGISTRY_FLAGS  QueryFlags;
++    WCHAR                       ValueName[MAX_PATH];
++    ULONG                       ValueType;
++    ULONG                       PhysicalAdapterIndex;
++    ULONG                       OutputValueSize;
++    D3DDDI_QUERYREGISTRY_STATUS Status;
++    union
++    {
++        DWORD                       OutputDword;
++        DECLSPEC_ALIGN(8) UINT64    OutputQword;
++        WCHAR                       OutputString[1];
++        BYTE                        OutputBinary[1];
++    };
++} D3DDDI_QUERYREGISTRY_INFO;
++
+ typedef enum _D3DKMT_QUERYRESULT_PREEMPTION_ATTEMPT_RESULT
+ {
+     D3DKMT_PreemptionAttempt                               = 0,
