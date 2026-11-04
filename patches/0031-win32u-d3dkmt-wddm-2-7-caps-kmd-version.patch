@@ -1,0 +1,139 @@
+Subject: [PATCH] win32u: Answer D3DKMT WDDM 2.7 caps for every graphics backend, and the KMD driver version.
+
+Forza Horizon 6 logged "NtGdiDdDDIQueryAdapterInfo type 70 not handled".  Type 70 is
+KMTQAITYPE_WDDM_2_7_CAPS (D3DKMT_WDDM_2_7_CAPS, one UINT: HwSchSupported, HwSchEnabled,
+HwSchEnabledByDefault, IndependentVidPnVSyncControl, 28 reserved bits).  CrossOver's own handler
+(CW HACK 24905) fills it only when CX_ACTIVE_GRAPHICS_BACKEND is "d3dmetal" and otherwise falls
+through to the "not handled" default and STATUS_NOT_IMPLEMENTED, which any other backend sees.
+
+  * 70 (WDDM_2_7_CAPS): the structure is cleared, then reports what a GeForce RTX 4070 (the
+    0x10de:0x2786 Highball reports) on driver 32.0.15.6094 reports on Windows 11: hardware GPU
+    scheduling supported, enabled and enabled by default; no independent VidPn vsync control.
+    WINE_D3DKMT_HWSCH=0 reports no hardware scheduling instead.  A buffer smaller than 4 bytes
+    is STATUS_INVALID_PARAMETER as before.
+  * 49 (KMD_DRIVER_VERSION): D3DKMT_KMD_DRIVER_VERSION, the same packed a.b.c.d as 0029's
+    UMD_DRIVER_VERSION (32.0.15.6094 or WINE_D3DKMT_DRIVER_VERSION), STATUS_INVALID_PARAMETER
+    below 8 bytes.  Adds the structure to include/ddk/d3dkmthk.h and tests to win32u/tests/d3dkmt.c.
+Applies after 0029 and 0030 on CrossOver 26.3.0 sources (sources/wine).
+
+---
+diff -ruN a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+--- a/dlls/win32u/d3dkmt.c	2026-11-04 01:06:23.528783759 -0600
++++ b/dlls/win32u/d3dkmt.c	2026-11-04 01:06:48.824760934 -0600
+@@ -894,23 +894,39 @@
+     }
+     case KMTQAITYPE_QUERYREGISTRY:
+         return d3dkmt_query_registry( desc );
+-    /* CW HACK 24905 */
++    case KMTQAITYPE_KMD_DRIVER_VERSION:
++    {
++        D3DKMT_KMD_DRIVER_VERSION *value = desc->pPrivateDriverData;
++
++        if (desc->PrivateDriverDataSize < sizeof(*value))
++            return STATUS_INVALID_PARAMETER;
++
++        /* A Windows NVIDIA driver's kernel and user mode parts carry the same version. */
++        value->DriverVersion.QuadPart = get_d3dkmt_driver_version_packed();
++        return STATUS_SUCCESS;
++    }
++    /* CW HACK 24905, extended: type 70 (D3DKMT_WDDM_2_7_CAPS) used to be answered only when
++     * CX_ACTIVE_GRAPHICS_BACKEND is "d3dmetal" and fell into "type 70 not handled" otherwise
++     * (Forza Horizon 6).  It is now answered for every backend the way the GeForce RTX 4070
++     * (0x10de:0x2786) of a Windows 11 machine with driver 32.0.15.6094 answers: hardware GPU
++     * scheduling supported, enabled and on by default, no independent VidPn vsync control.
++     * WINE_D3DKMT_HWSCH=0 reports it as unsupported instead. */
+     case KMTQAITYPE_WDDM_2_7_CAPS:
+     {
+         D3DKMT_WDDM_2_7_CAPS *caps = desc->pPrivateDriverData;
+-        char *active_gfx_backend = getenv("CX_ACTIVE_GRAPHICS_BACKEND");
++        const char *hwsch = getenv( "WINE_D3DKMT_HWSCH" );
+ 
+         if (desc->PrivateDriverDataSize < sizeof(*caps))
+             return STATUS_INVALID_PARAMETER;
+ 
+-        if (active_gfx_backend && !strcmp(active_gfx_backend, "d3dmetal"))
++        caps->Value = 0;
++        if (!hwsch || strcmp( hwsch, "0" ))
+         {
+-            caps->HwSchEnabled = 1;
+             caps->HwSchSupported = 1;
++            caps->HwSchEnabled = 1;
+             caps->HwSchEnabledByDefault = 1;
+-            return STATUS_SUCCESS;
+         }
+-        /* fallthrough */
++        return STATUS_SUCCESS;
+     }
+     default:
+     {
+diff -ruN a/dlls/win32u/tests/d3dkmt.c b/dlls/win32u/tests/d3dkmt.c
+--- a/dlls/win32u/tests/d3dkmt.c	2026-11-04 01:06:23.528783759 -0600
++++ b/dlls/win32u/tests/d3dkmt.c	2026-11-04 01:07:38.596716024 -0600
+@@ -30,6 +30,7 @@
+ #include "winternl.h"
+ #include "dwmapi.h"
+ #include "ddk/d3dkmthk.h"
++#include "d3dkmdt.h"
+ #include "initguid.h"
+ #include "setupapi.h"
+ #include "ntddvdeo.h"
+@@ -1646,6 +1647,41 @@
+         winetest_pop_context();
+     }
+ 
++    /* KMTQAITYPE_KMD_DRIVER_VERSION and KMTQAITYPE_WDDM_2_7_CAPS, newer than the table above */
++    {
++        D3DKMT_KMD_DRIVER_VERSION *kmd = (D3DKMT_KMD_DRIVER_VERSION *)buffer;
++        D3DKMT_WDDM_2_7_CAPS *caps = (D3DKMT_WDDM_2_7_CAPS *)buffer;
++
++        memset( buffer, 0, sizeof(buffer) );
++        query_adapter_info.hAdapter = open_adapter_desc.hAdapter;
++        query_adapter_info.Type = KMTQAITYPE_KMD_DRIVER_VERSION;
++        query_adapter_info.pPrivateDriverData = buffer;
++        query_adapter_info.PrivateDriverDataSize = sizeof(*kmd) - 1;
++        status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++        ok( status == STATUS_INVALID_PARAMETER || broken( status == STATUS_NOT_IMPLEMENTED ),
++            "Got unexpected return code %#lx.\n", status );
++        query_adapter_info.PrivateDriverDataSize = sizeof(*kmd);
++        status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++        ok( status == STATUS_SUCCESS || broken( status == STATUS_NOT_IMPLEMENTED ),
++            "Got unexpected return code %#lx.\n", status );
++        if (status == STATUS_SUCCESS)
++            ok( kmd->DriverVersion.QuadPart >> 48, "Got unexpected driver version %#I64x.\n",
++                kmd->DriverVersion.QuadPart );
++
++        memset( buffer, 0xcc, sizeof(buffer) );
++        query_adapter_info.Type = KMTQAITYPE_WDDM_2_7_CAPS;
++        query_adapter_info.PrivateDriverDataSize = sizeof(*caps) - 1;
++        status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++        ok( status == STATUS_INVALID_PARAMETER || broken( status == STATUS_NOT_IMPLEMENTED ),
++            "Got unexpected return code %#lx.\n", status );
++        query_adapter_info.PrivateDriverDataSize = sizeof(*caps);
++        status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++        ok( status == STATUS_SUCCESS || broken( status == STATUS_NOT_IMPLEMENTED ),
++            "Got unexpected return code %#lx.\n", status );
++        if (status == STATUS_SUCCESS)
++            ok( !caps->Reserved, "Got unexpected reserved bits %#x.\n", caps->Reserved );
++    }
++
+     /* KMTQAITYPE_QUERYREGISTRY, "DriverVersion" value of the adapter key */
+     {
+         static const WCHAR driver_versionW[] = L"DriverVersion";
+diff -ruN a/include/ddk/d3dkmthk.h b/include/ddk/d3dkmthk.h
+--- a/include/ddk/d3dkmthk.h	2026-11-04 01:06:23.524783763 -0600
++++ b/include/ddk/d3dkmthk.h	2026-11-04 01:06:48.820760938 -0600
+@@ -296,6 +296,14 @@
+     DECLSPEC_ALIGN(8) LARGE_INTEGER DriverVersion;
+ } D3DKMT_UMD_DRIVER_VERSION;
+ 
++/* KMTQAITYPE_KMD_DRIVER_VERSION (49), see
++ * https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmthk/ns-d3dkmthk-_d3dkmt_kmd_driver_version
++ * Same packing as D3DKMT_UMD_DRIVER_VERSION. */
++typedef struct _D3DKMT_KMD_DRIVER_VERSION
++{
++    DECLSPEC_ALIGN(8) LARGE_INTEGER DriverVersion;
++} D3DKMT_KMD_DRIVER_VERSION;
++
+ /* KMTQAITYPE_QUERYREGISTRY (48), see
+  * https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dukmdt/ns-d3dukmdt-_d3dddi_queryregistry_info
+  * The Microsoft documentation of the enum names D3DKMT_ADAPTERREGISTRYINFO for this type, but
