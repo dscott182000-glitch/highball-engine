@@ -1,0 +1,240 @@
+Subject: [PATCH] win32u: Answer the NGX path values of KMTQAITYPE_QUERYREGISTRY.
+
+Forza Horizon 6 issues KMTQAITYPE_QUERYREGISTRY (48) with QueryType
+D3DDDI_QUERYREGISTRY_SERVICEKEY (0) for the value names
+L"Parameters\NGXCore\NGXPath" and L"NGXCore\NGXPath".  They were answered with
+D3DDDI_QUERYREGISTRY_STATUS_FAIL.
+
+Both names (matched case-insensitively, on the service and the adapter key) now
+return D3DKMT_NGX_PATH, "C:\Windows\System32" by default (edit the #define in
+dlls/win32u/d3dkmt.c), as REG_SZ or REG_EXPAND_SZ, or as REG_MULTI_SZ with the
+double terminator.  Output sizing is unchanged: a too small buffer gives
+D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW and the required OutputValueSize.
+
+d3dkmt_query_registry() now looks the value name up in a small table of
+name -> handler (DriverVersion keeps its behaviour), and tests are added to
+win32u/tests/d3dkmt.c.  Applies on top of 0029-win32u-d3dkmt-query-driver-version.patch.
+
+---
+diff -ruN a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+--- a/dlls/win32u/d3dkmt.c	2026-11-03 19:00:17.791901179 -0600
++++ b/dlls/win32u/d3dkmt.c	2026-11-03 19:00:17.791901179 -0600
+@@ -721,17 +721,89 @@
+     return ((UINT64)v[0] << 48) | ((UINT64)v[1] << 32) | ((UINT64)v[2] << 16) | v[3];
+ }
+ 
++/* Path reported for the NGX (DLSS) runtime value, "NGXCore\\NGXPath" of the driver's service key,
++ * which Forza Horizon 6 queries.  Change it here to point NGX lookups elsewhere. */
++#define D3DKMT_NGX_PATH "C:\\Windows\\System32"
++
++/* Registry values answered by KMTQAITYPE_QUERYREGISTRY.  A handler writes the value for the requested
++ * registry type into out (at most D3DKMT_QUERYREGISTRY_MAX_OUTPUT bytes) and returns its size, or
++ * returns 0 when it has nothing for that type. */
++#define D3DKMT_QUERYREGISTRY_MAX_OUTPUT (2 * (MAX_PATH + 2))
++
++typedef UINT (*d3dkmt_registry_handler)( ULONG type, BYTE *out );
++
++static UINT put_ascii_string( const char *str, BYTE *out, UINT extra_nuls )
++{
++    WCHAR *dst = (WCHAR *)out;
++    UINT i, len = strlen( str );
++
++    for (i = 0; i < len; i++) dst[i] = (unsigned char)str[i];
++    for (i = 0; i <= extra_nuls; i++) dst[len + i] = 0;
++    return (len + 1 + extra_nuls) * sizeof(WCHAR);
++}
++
++static UINT registry_driver_version( ULONG type, BYTE *out )
++{
++    UINT16 v[4];
++    char buf[32];
++
++    switch (type)
++    {
++    case REG_SZ:
++        get_d3dkmt_driver_version( v );
++        snprintf( buf, sizeof(buf), "%u.%u.%u.%u", v[0], v[1], v[2], v[3] );
++        return put_ascii_string( buf, out, 0 );
++    case REG_QWORD:
++        *(UINT64 *)out = get_d3dkmt_driver_version_packed();
++        return sizeof(UINT64);
++    }
++    return 0;
++}
++
++static UINT registry_ngx_path( ULONG type, BYTE *out )
++{
++    switch (type)
++    {
++    case REG_SZ:
++    case REG_EXPAND_SZ:
++        return put_ascii_string( D3DKMT_NGX_PATH, out, 0 );
++    case REG_MULTI_SZ: /* the list ends with an empty string */
++        return put_ascii_string( D3DKMT_NGX_PATH, out, 1 );
++    }
++    return 0;
++}
++
++static const struct d3dkmt_registry_value
++{
++    const char *name;  /* ASCII, matched case-insensitively */
++    d3dkmt_registry_handler handler;
++}
++d3dkmt_registry_values[] =
++{
++    { "DriverVersion", registry_driver_version },
++    { "Parameters\\NGXCore\\NGXPath", registry_ngx_path },
++    { "NGXCore\\NGXPath", registry_ngx_path },
++};
++
++static BOOL registry_name_equal( const WCHAR *name, const char *ref )
++{
++    for (;; name++, ref++)
++    {
++        WCHAR a = *name, b = (unsigned char)*ref;
++        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
++        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
++        if (a != b) return FALSE;
++        if (!a) return TRUE;
++    }
++}
++
+ static NTSTATUS d3dkmt_query_registry( D3DKMT_QUERYADAPTERINFO *desc )
+ {
+-    static const WCHAR driver_versionW[] =
+-        { 'D','r','i','v','e','r','V','e','r','s','i','o','n',0 };
+     D3DDDI_QUERYREGISTRY_INFO *info = desc->pPrivateDriverData;
+     const UINT output_offset = offsetof( D3DDDI_QUERYREGISTRY_INFO, OutputDword );
+-    UINT size = desc->PrivateDriverDataSize, needed;
+-    UINT16 v[4];
+-    WCHAR str[32];
+-    char buf[32];
+-    UINT len, i;
++    UINT size = desc->PrivateDriverDataSize, needed = 0, i;
++    d3dkmt_registry_handler handler = NULL;
++    BYTE output[D3DKMT_QUERYREGISTRY_MAX_OUTPUT];
+ 
+     /* Status is the last field before the output, nothing can be reported without it. */
+     if (size < output_offset) return STATUS_INVALID_PARAMETER;
+@@ -741,28 +813,27 @@
+         return STATUS_INVALID_PARAMETER;
+     }
+ 
+-    if ((info->QueryType != D3DDDI_QUERYREGISTRY_SERVICEKEY && info->QueryType != D3DDDI_QUERYREGISTRY_ADAPTERKEY) ||
+-        info->ValueName[ARRAY_SIZE(info->ValueName) - 1] ||
+-        wcsicmp( info->ValueName, driver_versionW ))
++    if ((info->QueryType == D3DDDI_QUERYREGISTRY_SERVICEKEY || info->QueryType == D3DDDI_QUERYREGISTRY_ADAPTERKEY) &&
++        !info->ValueName[ARRAY_SIZE(info->ValueName) - 1])
++    {
++        for (i = 0; i < ARRAY_SIZE(d3dkmt_registry_values); i++)
++        {
++            if (!registry_name_equal( info->ValueName, d3dkmt_registry_values[i].name )) continue;
++            handler = d3dkmt_registry_values[i].handler;
++            break;
++        }
++    }
++    if (!handler)
+     {
+         FIXME( "QUERYREGISTRY type %d value %s not handled.\n", info->QueryType, debugstr_w( info->ValueName ) );
+         info->Status = D3DDDI_QUERYREGISTRY_STATUS_FAIL;
+         return STATUS_SUCCESS;
+     }
+ 
+-    get_d3dkmt_driver_version( v );
+-    switch (info->ValueType)
++    if (!(needed = handler( info->ValueType, output )))
+     {
+-    case REG_SZ:
+-        len = snprintf( buf, sizeof(buf), "%u.%u.%u.%u", v[0], v[1], v[2], v[3] );
+-        for (i = 0; i <= len; i++) str[i] = buf[i];
+-        needed = (len + 1) * sizeof(WCHAR);
+-        break;
+-    case REG_QWORD:
+-        needed = sizeof(UINT64);
+-        break;
+-    default:
+-        FIXME( "DriverVersion with value type %u not handled.\n", (unsigned int)info->ValueType );
++        FIXME( "QUERYREGISTRY value %s with value type %u not handled.\n", debugstr_w( info->ValueName ),
++               (unsigned int)info->ValueType );
+         info->Status = D3DDDI_QUERYREGISTRY_STATUS_FAIL;
+         return STATUS_SUCCESS;
+     }
+@@ -774,8 +845,7 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (info->ValueType == REG_SZ) memcpy( info->OutputString, str, needed );
+-    else info->OutputQword = get_d3dkmt_driver_version_packed();
++    memcpy( info->OutputBinary, output, needed );
+     info->Status = D3DDDI_QUERYREGISTRY_STATUS_SUCCESS;
+     return STATUS_SUCCESS;
+ }
+diff -ruN a/dlls/win32u/tests/d3dkmt.c b/dlls/win32u/tests/d3dkmt.c
+--- a/dlls/win32u/tests/d3dkmt.c	2026-11-03 19:00:17.791901179 -0600
++++ b/dlls/win32u/tests/d3dkmt.c	2026-11-03 19:00:17.795901175 -0600
+@@ -1685,6 +1685,65 @@
+                 info->Status == D3DDDI_QUERYREGISTRY_STATUS_SUCCESS, "Got unexpected status %u.\n", info->Status );
+         }
+ 
++        /* NGX path values of the service key, matched case-insensitively */
++        {
++            static const struct
++            {
++                const WCHAR *name;
++                D3DDDI_QUERYREGISTRY_TYPE query_type;
++                ULONG value_type;
++            }
++            ngx_tests[] =
++            {
++                {L"Parameters\\NGXCore\\NGXPath", D3DDDI_QUERYREGISTRY_SERVICEKEY, REG_SZ},
++                {L"NGXCore\\NGXPath", D3DDDI_QUERYREGISTRY_SERVICEKEY, REG_SZ},
++                {L"ngxcore\\ngxpath", D3DDDI_QUERYREGISTRY_SERVICEKEY, REG_EXPAND_SZ},
++                {L"PARAMETERS\\NGXCORE\\NGXPATH", D3DDDI_QUERYREGISTRY_ADAPTERKEY, REG_SZ},
++                {L"NGXCore\\NGXPath", D3DDDI_QUERYREGISTRY_SERVICEKEY, REG_MULTI_SZ},
++            };
++            unsigned int j;
++
++            for (j = 0; j < ARRAY_SIZE(ngx_tests); j++)
++            {
++                winetest_push_context( "ngx %u", j );
++                memset( buffer, 0, sizeof(buffer) );
++                info->QueryType = ngx_tests[j].query_type;
++                info->ValueType = ngx_tests[j].value_type;
++                lstrcpyW( info->ValueName, ngx_tests[j].name );
++                query_adapter_info.PrivateDriverDataSize = sizeof(buffer);
++                status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++                ok( status == STATUS_SUCCESS || broken( status == STATUS_INVALID_PARAMETER ),
++                    "Got unexpected return code %#lx.\n", status );
++
++                if (status == STATUS_SUCCESS && info->Status == D3DDDI_QUERYREGISTRY_STATUS_SUCCESS)
++                {
++                    len = wcslen( info->OutputString );
++                    ok( len, "Got an empty path.\n" );
++                    if (ngx_tests[j].value_type == REG_MULTI_SZ)
++                    {
++                        ok( !info->OutputString[len + 1], "Missing the list terminator.\n" );
++                        ok( info->OutputValueSize == (len + 2) * sizeof(WCHAR), "Got unexpected size %lu.\n",
++                            info->OutputValueSize );
++                    }
++                    else
++                    {
++                        ok( info->OutputValueSize == (len + 1) * sizeof(WCHAR), "Got unexpected size %lu.\n",
++                            info->OutputValueSize );
++                    }
++
++                    /* Too small an output buffer reports the required size */
++                    query_adapter_info.PrivateDriverDataSize = sizeof(*info);
++                    status = D3DKMTQueryAdapterInfo( &query_adapter_info );
++                    ok( status == STATUS_SUCCESS, "Got unexpected return code %#lx.\n", status );
++                    ok( info->Status == D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW ||
++                        info->Status == D3DDDI_QUERYREGISTRY_STATUS_SUCCESS, "Got unexpected status %u.\n",
++                        info->Status );
++                }
++                winetest_pop_context();
++            }
++            query_adapter_info.PrivateDriverDataSize = sizeof(buffer);
++        }
++
+         /* Buffer smaller than the fixed part of the structure */
+         query_adapter_info.PrivateDriverDataSize = 16;
+         status = D3DKMTQueryAdapterInfo( &query_adapter_info );
