@@ -1,0 +1,492 @@
+Subject: [PATCH] win32u: Present one GPU identity everywhere (0x10de spoof), nvapi64: log load (Forza Horizon 6).
+
+With D3DM_VENDOR_ID=0x10de D3DMetal's own dxgi/d3d12 report an NVIDIA adapter, and 0033 added an
+NVIDIA NvAPI, but Wine itself still described the real Apple GPU: the registry display adapter keys,
+EnumDisplayDevices and the Vulkan-derived list (MoltenVK's "Apple M5 Pro 0x106b") all said Apple.
+A game that cross-checks DXGI against the registry / D3DKMT / WMI saw two different GPUs.
+
+get_gpu_spoof() (dlls/win32u/d3dkmt.c) reads the identity from the environment. Active when
+WINE_GPU_VENDOR_ID=10de (hex, 0x optional) or D3DM_VENDOR_ID=0x10de; off otherwise. Optional:
+WINE_GPU_DEVICE_ID / D3DM_DEVICE_ID (default 0x2786), WINE_GPU_SUBSYS_ID (default 0x40A81458),
+WINE_GPU_REVISION (default 0xA1), WINE_GPU_DESCRIPTION / D3DM_DEVICE_DESCRIPTION (default the name of
+the device id, else "NVIDIA GeForce RTX 4070"), WINE_GPU_MEMORY_MB (default: at least 12 GiB).
+
+  * sysparams.c add_gpu(), the single point every GPU passes through (winemac's macdrv_get_gpus
+    list, the Vulkan fallback, the registry), replaces vendor/device/subsystem/revision, the name and
+    the memory size after the Vulkan GPU was matched. The Vulkan uuid and the LUID are untouched, so
+    D3DKMT OpenAdapterFromLuid keeps resolving the same physical device. write_gpu_to_registry then
+    writes PCI\VEN_10DE&DEV_2786&SUBSYS_40A81458&REV_A1, ProviderName "NVIDIA", DriverDesc,
+    HardwareInformation.AdapterString/ChipType, a 12 GiB MemorySize and the 35.0.15.6094 driver
+    version; EnumDisplayDevices, SetupAPI and the DirectX key follow.
+  * NtGdiDdDDIQueryAdapterInfo answers PHYSICALADAPTERDEVICEIDS, ADAPTERADDRESS,
+    ADAPTERREGISTRYINFO and DRIVER_DESCRIPTION from the same values (only while the override is
+    active; otherwise they still return STATUS_NOT_IMPLEMENTED). Structs added to d3dkmthk.h.
+  * wined3d: VideoPciVendorID / VideoPciDeviceID default to the same ids (the registry and
+    WINE_D3D_CONFIG settings still win).
+  * wbemprox: Win32_VideoController.AdapterCompatibility is "NVIDIA" for a VEN_10DE adapter
+    (Name, PNPDeviceID, DriverVersion, AdapterRAM already come from the registry).
+  * nvapi64: uses the same WINE_GPU_* variables, and has a DllMain that logs once, at WARN level in
+    the nvapi channel, "nvapi64 builtin stand-in loaded: ..." (and on unload), so a log shows that
+    the stand-in was loaded even if the game never calls nvapi_QueryInterface.
+
+---
+diff --git a/dlls/nvapi64/nvapi.c b/dlls/nvapi64/nvapi.c
+index 4585d4c..b6a91e1 100644
+--- a/dlls/nvapi64/nvapi.c
++++ b/dlls/nvapi64/nvapi.c
+@@ -28,9 +28,14 @@
+  * PCI ids, architecture, video memory and driver/branch version, taken from the same
+  * environment variables D3DMetal and the d3dkmt layer already use.
+  *
+- *   WINE_NVAPI=0|1              force off / on (default: on when D3DM_VENDOR_ID is 0x10de)
+- *   D3DM_DEVICE_ID              PCI device id reported (default 0x2786, RTX 4070)
+- *   D3DM_DEVICE_DESCRIPTION     GPU name (default "NVIDIA GeForce RTX 4070")
++ *   WINE_NVAPI=0|1              force off / on (default: on when D3DM_VENDOR_ID or
++ *                               WINE_GPU_VENDOR_ID is 0x10de)
++ *   WINE_GPU_DEVICE_ID, D3DM_DEVICE_ID
++ *                               PCI device id reported (default 0x2786, RTX 4070); win32u uses the
++ *                               same variables for the registry and D3DKMT (also WINE_GPU_SUBSYS_ID,
++ *                               WINE_GPU_REVISION)
++ *   WINE_GPU_DESCRIPTION, D3DM_DEVICE_DESCRIPTION
++ *                               GPU name (default "NVIDIA GeForce RTX 4070")
+  *   WINE_NVAPI_DRIVER_VERSION   56094, 560.94 or 35.0.15.6094 (default: derived from
+  *                               WINE_D3DKMT_DRIVER_VERSION, else 56094)
+  *
+@@ -244,7 +249,23 @@ static BOOL nvapi_enabled(void)
+         if (buf[0] == '0') return FALSE;
+         if (buf[0] == '1') return TRUE;
+     }
+-    return parse_hex_env( "D3DM_VENDOR_ID", 0 ) == 0x10de;
++    return parse_hex_env( "WINE_GPU_VENDOR_ID", 0 ) == 0x10de || parse_hex_env( "D3DM_VENDOR_ID", 0 ) == 0x10de;
++}
++
++/* The same ids win32u's GPU spoof (WINE_GPU_*, D3DM_*) writes to the registry. */
++static unsigned int get_device_id(void)
++{
++    return parse_hex_env( "WINE_GPU_DEVICE_ID", parse_hex_env( "D3DM_DEVICE_ID", DEFAULT_DEVICE_ID ) ) & 0xffff;
++}
++
++static unsigned int get_subsystem_id(void)
++{
++    return parse_hex_env( "WINE_GPU_SUBSYS_ID", SUBSYSTEM_ID );
++}
++
++static unsigned int get_revision_id(void)
++{
++    return parse_hex_env( "WINE_GPU_REVISION", NV_CHIP_REVISION_A1 ) & 0xff;
+ }
+ 
+ static void set_string( char *dst, const char *src )
+@@ -270,7 +291,8 @@ static void get_gpu_name( char *dst )
+ {
+     char buf[NVAPI_SHORT_STRING_MAX];
+ 
+-    if (get_env( "D3DM_DEVICE_DESCRIPTION", buf, sizeof(buf) )) set_string( dst, buf );
++    if (get_env( "WINE_GPU_DESCRIPTION", buf, sizeof(buf) ) || get_env( "D3DM_DEVICE_DESCRIPTION", buf, sizeof(buf) ))
++        set_string( dst, buf );
+     else set_string( dst, DEFAULT_DEVICE_NAME );
+ }
+ 
+@@ -410,14 +432,14 @@ static NvAPI_Status NVAPI_CALL NvAPI_GPU_GetFullName( NvHandle physical, char *n
+ static NvAPI_Status NVAPI_CALL NvAPI_GPU_GetPCIIdentifiers( NvHandle physical, NvU32 *device_id, NvU32 *subsystem_id,
+         NvU32 *revision_id, NvU32 *ext_device_id )
+ {
+-    unsigned int device = parse_hex_env( "D3DM_DEVICE_ID", DEFAULT_DEVICE_ID ) & 0xffff;
++    unsigned int device = get_device_id();
+     NvAPI_Status ret = check_physical( physical );
+ 
+     if (ret) return ret;
+     if (!device_id || !subsystem_id || !revision_id || !ext_device_id) return NVAPI_INVALID_ARGUMENT;
+     *device_id = (device << 16) | 0x10de;
+-    *subsystem_id = SUBSYSTEM_ID;
+-    *revision_id = NV_CHIP_REVISION_A1;
++    *subsystem_id = get_subsystem_id();
++    *revision_id = get_revision_id();
+     *ext_device_id = device;
+     return NVAPI_OK;
+ }
+@@ -632,3 +654,22 @@ void * NVAPI_CALL nvapi_QueryInterface( unsigned int id )
+     FIXME( "unknown interface id %#x\n", id );
+     return NULL;
+ }
++
++/* Under WINEDEBUG=+nvapi (or warn+nvapi) this line tells that the stand-in, and not the
++ * empty fake dll or D3DMetal's own nvapi64.dll, was loaded, and whether it will answer. */
++BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
++{
++    switch (reason)
++    {
++    case DLL_PROCESS_ATTACH:
++        DisableThreadLibraryCalls( instance );
++        WARN( "nvapi64 builtin stand-in loaded: %s, device %04x, driver %u (%s)\n",
++              nvapi_enabled() ? "answering as an NVIDIA GPU" : "disabled (no NVIDIA identity requested)",
++              get_device_id(), get_driver_version(), reserved ? "static import" : "LoadLibrary" );
++        break;
++    case DLL_PROCESS_DETACH:
++        if (!reserved) WARN( "nvapi64 builtin stand-in unloaded\n" );
++        break;
++    }
++    return TRUE;
++}
+diff --git a/dlls/wbemprox/builtin.c b/dlls/wbemprox/builtin.c
+index de3c060..cc9fe70 100644
+--- a/dlls/wbemprox/builtin.c
++++ b/dlls/wbemprox/builtin.c
+@@ -4776,6 +4776,16 @@ static const WCHAR *convert_driverdate( const WCHAR *date )
+     return ret;
+ }
+ 
++static const WCHAR *get_adapter_compatibility( const WCHAR *pnp_id )
++{
++    /* "PCI\\VEN_10DE&DEV_2786&..." */
++    if (pnp_id && !wcsnicmp( pnp_id, L"PCI\\VEN_", 8 ))
++    {
++        if (!wcsnicmp( pnp_id + 8, L"10DE", 4 )) return L"NVIDIA";
++    }
++    return L"(Standard display types)";
++}
++
+ static enum fill_status fill_videocontroller( struct table *table, const struct expr *cond )
+ {
+     struct record_videocontroller *rec;
+@@ -4794,7 +4804,7 @@ static enum fill_status fill_videocontroller( struct table *table, const struct
+     for (i = 0; i < count; i++)
+     {
+         rec = (struct record_videocontroller *)(table->data + offset);
+-        rec->adapter_compatibility = L"(Standard display types)";
++        rec->adapter_compatibility = get_adapter_compatibility( adapters[i].pnpdevice_id );
+         rec->adapter_dactype       = adapters[i].dac_type;
+         rec->adapter_ram           = adapters[i].memory_size;
+         rec->availability          = 3; /* Running or Full Power */
+diff --git a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+index c4ae44c..08ab5f6 100644
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -723,6 +723,76 @@ UINT64 get_d3dkmt_driver_version_packed(void)
+     return ((UINT64)v[0] << 48) | ((UINT64)v[1] << 32) | ((UINT64)v[2] << 16) | v[3];
+ }
+ 
++/* GPU identity override.  When an NVIDIA (or other) identity is requested in the environment,
++ * sysparams.c (add_gpu) replaces the PCI ids, name and memory size of every GPU it enumerates, no
++ * matter whether the list came from winemac, the Vulkan fallback or the registry, so the display
++ * adapter registry keys, EnumDisplayDevices, SetupAPI, wbemprox Win32_VideoController, dxdiag and
++ * the D3DKMT queries below all agree.  The override is active when
++ *
++ *   WINE_GPU_VENDOR_ID=10de (hex, 0x prefix optional), or
++ *   D3DM_VENDOR_ID=0x10de   (the variable D3DMetal itself reads)
++ *
++ * and is off otherwise.  Optional variables (hex unless noted):
++ *   WINE_GPU_DEVICE_ID / D3DM_DEVICE_ID   default 0x2786 (GeForce RTX 4070) for NVIDIA
++ *   WINE_GPU_SUBSYS_ID                    default 0x40a81458 (device 0x40a8, subvendor 0x1458)
++ *   WINE_GPU_REVISION                     default 0xa1
++ *   WINE_GPU_DESCRIPTION / D3DM_DEVICE_DESCRIPTION
++ *                                         default: name of the device id, else "NVIDIA GeForce RTX 4070"
++ *   WINE_GPU_MEMORY_MB (decimal)          default: at least 12288 (12 GiB) for NVIDIA
++ * dlls/nvapi64 reads the same variables. */
++static BOOL gpu_env_hex( const char *name, unsigned int *ret )
++{
++    const char *env = getenv( name );
++    unsigned int value;
++    char extra;
++
++    if (!env || !*env) return FALSE;
++    if (sscanf( env, "%x%c", &value, &extra ) != 1)
++    {
++        WARN( "Ignoring invalid %s=%s.\n", name, debugstr_a(env) );
++        return FALSE;
++    }
++    *ret = value;
++    return TRUE;
++}
++
++BOOL get_gpu_spoof( struct gpu_spoof *spoof )
++{
++    unsigned int vendor, device, subsys, revision, memory_mb;
++    const char *desc;
++    BOOL nvidia;
++
++    memset( spoof, 0, sizeof(*spoof) );
++
++    if (!gpu_env_hex( "WINE_GPU_VENDOR_ID", &vendor ))
++    {
++        if (!gpu_env_hex( "D3DM_VENDOR_ID", &vendor ) || vendor != 0x10de) return FALSE;
++    }
++    if (!vendor || vendor > 0xffff) return FALSE;
++    nvidia = vendor == 0x10de;
++
++    spoof->vendor = vendor;
++    if (gpu_env_hex( "WINE_GPU_DEVICE_ID", &device ) || gpu_env_hex( "D3DM_DEVICE_ID", &device )) spoof->device = device & 0xffff;
++    else if (nvidia) spoof->device = 0x2786;
++    if (gpu_env_hex( "WINE_GPU_SUBSYS_ID", &subsys )) spoof->subsystem = subsys;
++    else if (nvidia) spoof->subsystem = 0x40a81458;
++    if (gpu_env_hex( "WINE_GPU_REVISION", &revision )) spoof->revision = revision;
++    else if (nvidia) spoof->revision = 0xa1;
++
++    if (!(desc = getenv( "WINE_GPU_DESCRIPTION" )) || !*desc) desc = getenv( "D3DM_DEVICE_DESCRIPTION" );
++    if (desc && *desc) snprintf( spoof->name, sizeof(spoof->name), "%s", desc );
++    else if (nvidia) snprintf( spoof->name, sizeof(spoof->name), "%s",
++                               gpu_device_name( vendor, spoof->device, "NVIDIA GeForce RTX 4070" ));
++
++    if ((desc = getenv( "WINE_GPU_MEMORY_MB" )) && sscanf( desc, "%u", &memory_mb ) == 1 && memory_mb)
++    {
++        spoof->memory = (UINT64)memory_mb << 20;
++        spoof->memory_exact = TRUE;
++    }
++    else if (nvidia) spoof->memory = (UINT64)12288 << 20;
++    return TRUE;
++}
++
+ /* Path reported for the NGX (DLSS) runtime value, "NGXCore\\NGXPath" of the driver's service key,
+  * which Forza Horizon 6 queries.  Change it here to point NGX lookups elsewhere. */
+ #define D3DKMT_NGX_PATH "C:\\Windows\\System32"
+@@ -930,6 +1000,73 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
+         }
+         return STATUS_SUCCESS;
+     }
++    /* The adapter identity queries below are only answered while the GPU identity override
++     * (get_gpu_spoof) is active, and then from the same values add_gpu writes to the registry.
++     * They describe the one GPU Wine presents, whichever hAdapter is passed. */
++    case KMTQAITYPE_PHYSICALADAPTERDEVICEIDS:
++    case KMTQAITYPE_ADAPTERADDRESS:
++    case KMTQAITYPE_ADAPTERREGISTRYINFO:
++    case KMTQAITYPE_DRIVER_DESCRIPTION:
++    {
++        struct gpu_spoof spoof;
++        WCHAR name[MAX_PATH], dac[MAX_PATH];
++        DWORD len;
++
++        if (!get_gpu_spoof( &spoof ))
++        {
++            FIXME( "type %d not handled.\n", desc->Type );
++            return STATUS_NOT_IMPLEMENTED;
++        }
++        if (!spoof.name[0]) snprintf( spoof.name, sizeof(spoof.name), "NVIDIA GeForce RTX 4070" );
++        RtlUTF8ToUnicodeN( name, sizeof(name) - sizeof(WCHAR), &len, spoof.name, strlen( spoof.name ));
++        name[len / sizeof(WCHAR)] = 0;
++        RtlUTF8ToUnicodeN( dac, sizeof(dac) - sizeof(WCHAR), &len, "Integrated RAMDAC", 17 );
++        dac[len / sizeof(WCHAR)] = 0;
++
++        if (desc->Type == KMTQAITYPE_PHYSICALADAPTERDEVICEIDS)
++        {
++            D3DKMT_QUERY_DEVICE_IDS *ids = desc->pPrivateDriverData;
++
++            if (desc->PrivateDriverDataSize < sizeof(*ids) || ids->PhysicalAdapterIndex) return STATUS_INVALID_PARAMETER;
++            memset( &ids->DeviceIds, 0, sizeof(ids->DeviceIds) );
++            ids->DeviceIds.VendorID = spoof.vendor;
++            ids->DeviceIds.DeviceID = spoof.device;
++            ids->DeviceIds.SubVendorID = spoof.subsystem & 0xffff;
++            ids->DeviceIds.SubSystemID = spoof.subsystem >> 16;
++            ids->DeviceIds.RevisionID = spoof.revision;
++            return STATUS_SUCCESS;
++        }
++        if (desc->Type == KMTQAITYPE_ADAPTERADDRESS)
++        {
++            D3DKMT_ADAPTERADDRESS *addr = desc->pPrivateDriverData;
++
++            if (desc->PrivateDriverDataSize < sizeof(*addr)) return STATUS_INVALID_PARAMETER;
++            addr->BusNumber = 1;        /* 01:00.0, where a discrete GPU usually sits */
++            addr->DeviceNumber = 0;
++            addr->FunctionNumber = 0;
++            return STATUS_SUCCESS;
++        }
++        if (desc->Type == KMTQAITYPE_ADAPTERREGISTRYINFO)
++        {
++            D3DKMT_ADAPTERREGISTRYINFO *info = desc->pPrivateDriverData;
++
++            if (desc->PrivateDriverDataSize < sizeof(*info)) return STATUS_INVALID_PARAMETER;
++            memset( info, 0, sizeof(*info) );
++            memcpy( info->AdapterString, name, sizeof(name) );
++            memcpy( info->ChipType, name, sizeof(name) );
++            memcpy( info->DacType, dac, sizeof(dac) );
++            return STATUS_SUCCESS;
++        }
++        else
++        {
++            D3DKMT_DRIVER_DESCRIPTION *info = desc->pPrivateDriverData;
++
++            if (desc->PrivateDriverDataSize < sizeof(*info)) return STATUS_INVALID_PARAMETER;
++            memset( info, 0, sizeof(*info) );
++            memcpy( info->DriverDescription, name, sizeof(name) );
++            return STATUS_SUCCESS;
++        }
++    }
+     default:
+     {
+         FIXME( "type %d not handled.\n", desc->Type );
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index 7160c83..c5327f0 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -1708,6 +1708,10 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
+     unsigned int i;
+     HKEY hkey, subkey;
+     DWORD len;
++    struct gpu_spoof spoof;
++    struct pci_id spoofed_pci;
++    UINT64 memory;
++    BOOL spoofed;
+ 
+     static const GUID empty_uuid;
+ 
+@@ -1746,9 +1750,27 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
+     else if (vulkan_gpu) gpu->vulkan_uuid = vulkan_gpu->uuid;
+ 
+     if (!pci_id->vendor && !pci_id->device && vulkan_gpu) pci_id = &vulkan_gpu->pci_id;
++    memory = vulkan_gpu ? vulkan_gpu->memory : 0;
++
++    /* GPU identity override (WINE_GPU_* / D3DM_VENDOR_ID, see get_gpu_spoof in d3dkmt.c).  It is applied
++     * after the Vulkan GPU was matched, so the Vulkan uuid and the LUID keep identifying the same GPU. */
++    if ((spoofed = get_gpu_spoof( &spoof )))
++    {
++        spoofed_pci = *pci_id;
++        spoofed_pci.vendor = spoof.vendor;
++        if (spoof.device) spoofed_pci.device = spoof.device;
++        if (spoof.subsystem) spoofed_pci.subsystem = spoof.subsystem;
++        spoofed_pci.revision = spoof.revision;
++        WARN( "Presenting GPU %s %04X:%04X as %04X:%04X subsys %08X rev %02X\n", debugstr_a( name ),
++              pci_id->vendor, pci_id->device, spoofed_pci.vendor, spoofed_pci.device,
++              spoofed_pci.subsystem, spoofed_pci.revision );
++        pci_id = &spoofed_pci;
++        if (spoof.memory && (spoof.memory_exact || spoof.memory > memory)) memory = spoof.memory;
++    }
+ 
+     name = gpu_device_name( pci_id->vendor, pci_id->device, name );
+     if (!strcmp( name, "Wine Adapter" ) && vulkan_gpu) name = vulkan_gpu->name;
++    if (spoofed && spoof.name[0]) name = spoof.name;
+     RtlUTF8ToUnicodeN( gpu->name, sizeof(gpu->name) - sizeof(WCHAR), &len, name, strlen( name ) );
+ 
+     snprintf( gpu->path, sizeof(gpu->path), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_%08X&REV_%02X\\%08X",
+@@ -1792,7 +1814,7 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
+ 
+     NtClose( hkey );
+ 
+-    if (!write_gpu_to_registry( gpu, pci_id, vulkan_gpu ? vulkan_gpu->memory : 0 ))
++    if (!write_gpu_to_registry( gpu, pci_id, memory ))
+     {
+         WARN( "Failed to write gpu %p to registry\n", gpu );
+         gpu_release( gpu );
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index c5894f3..6c8e2d2 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -198,6 +198,19 @@ extern void user_check_not_lock(void);
+ extern void get_d3dkmt_driver_version( UINT16 parts[4] );
+ extern UINT64 get_d3dkmt_driver_version_packed(void);
+ 
++/* GPU identity override (WINE_GPU_* / D3DM_VENDOR_ID, see d3dkmt.c) */
++struct gpu_spoof
++{
++    UINT16 vendor;
++    UINT16 device;          /* 0: keep the real device id */
++    UINT32 subsystem;       /* 0: keep the real subsystem id */
++    UINT8  revision;
++    char   name[128];       /* empty: keep the real name */
++    UINT64 memory;          /* video memory in bytes, 0: keep the real size */
++    BOOL   memory_exact;    /* memory was requested explicitly, do not take the larger real size */
++};
++extern BOOL get_gpu_spoof( struct gpu_spoof *spoof );
++
+ /* d3dkmtc. */
+ 
+ struct vulkan_gpu
+diff --git a/dlls/wined3d/wined3d_main.c b/dlls/wined3d/wined3d_main.c
+index b40ea08..a9d3dd5 100644
+--- a/dlls/wined3d/wined3d_main.c
++++ b/dlls/wined3d/wined3d_main.c
+@@ -277,6 +277,17 @@ static void vkd3d_log_callback(const char *fmt, va_list args)
+     __wine_dbg_output(buffer);
+ }
+ 
++static unsigned long wined3d_env_hex(const char *name, unsigned long def)
++{
++    const char *env = getenv(name);
++    char *end;
++    unsigned long value;
++
++    if (!env || !*env) return def;
++    value = strtoul(env, &end, 16);
++    return *end ? def : value;
++}
++
+ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
+ {
+     DWORD wined3d_context_tls_idx;
+@@ -492,6 +503,26 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
+         }
+     }
+ 
++    /* GPU identity override shared with win32u (dlls/win32u/d3dkmt.c get_gpu_spoof): WINE_GPU_VENDOR_ID or
++     * D3DM_VENDOR_ID=0x10de, with WINE_GPU_DEVICE_ID / D3DM_DEVICE_ID (default 0x2786).  The Direct3D
++     * VideoPciVendorID / VideoPciDeviceID settings above take precedence. */
++    if (wined3d_settings.pci_vendor_id == PCI_VENDOR_NONE && wined3d_settings.pci_device_id == PCI_DEVICE_NONE)
++    {
++        unsigned long vendor = wined3d_env_hex("WINE_GPU_VENDOR_ID", 0), device;
++
++        if (!vendor && wined3d_env_hex("D3DM_VENDOR_ID", 0) == 0x10de) vendor = 0x10de;
++        if (vendor && vendor <= 0xffff)
++        {
++            device = wined3d_env_hex("WINE_GPU_DEVICE_ID", wined3d_env_hex("D3DM_DEVICE_ID", vendor == 0x10de ? 0x2786 : 0));
++            if (device && device <= 0xffff)
++            {
++                TRACE("Using PCI ids %04lx:%04lx from the GPU identity override.\n", vendor, device);
++                wined3d_settings.pci_vendor_id = vendor;
++                wined3d_settings.pci_device_id = device;
++            }
++        }
++    }
++
+     if (appkey) RegCloseKey( appkey );
+     if (hkey) RegCloseKey( hkey );
+ 
+diff --git a/include/ddk/d3dkmthk.h b/include/ddk/d3dkmthk.h
+index b76bb71..88206f6 100644
+--- a/include/ddk/d3dkmthk.h
++++ b/include/ddk/d3dkmthk.h
+@@ -304,6 +304,47 @@ typedef struct _D3DKMT_KMD_DRIVER_VERSION
+     DECLSPEC_ALIGN(8) LARGE_INTEGER DriverVersion;
+ } D3DKMT_KMD_DRIVER_VERSION;
+ 
++/* KMTQAITYPE_ADAPTERADDRESS (6): PCI location of the adapter. */
++typedef struct _D3DKMT_ADAPTERADDRESS
++{
++    UINT BusNumber;
++    UINT DeviceNumber;
++    UINT FunctionNumber;
++} D3DKMT_ADAPTERADDRESS;
++
++/* KMTQAITYPE_ADAPTERREGISTRYINFO (8) */
++typedef struct _D3DKMT_ADAPTERREGISTRYINFO
++{
++    WCHAR AdapterString[MAX_PATH];
++    WCHAR BiosString[MAX_PATH];
++    WCHAR DacType[MAX_PATH];
++    WCHAR ChipType[MAX_PATH];
++} D3DKMT_ADAPTERREGISTRYINFO;
++
++/* KMTQAITYPE_DRIVER_DESCRIPTION (65) */
++typedef struct _D3DKMT_DRIVER_DESCRIPTION
++{
++    WCHAR DriverDescription[4096];
++} D3DKMT_DRIVER_DESCRIPTION;
++
++/* KMTQAITYPE_PHYSICALADAPTERDEVICEIDS (31), see
++ * https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmthk/ns-d3dkmthk-_d3dkmt_query_device_ids */
++typedef struct _D3DKMT_DEVICE_IDS
++{
++    UINT VendorID;
++    UINT DeviceID;
++    UINT SubVendorID;
++    UINT SubSystemID;
++    UINT RevisionID;
++    UINT BusType;
++} D3DKMT_DEVICE_IDS;
++
++typedef struct _D3DKMT_QUERY_DEVICE_IDS
++{
++    UINT PhysicalAdapterIndex;
++    D3DKMT_DEVICE_IDS DeviceIds;
++} D3DKMT_QUERY_DEVICE_IDS;
++
+ /* KMTQAITYPE_QUERYREGISTRY (48), see
+  * https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dukmdt/ns-d3dukmdt-_d3dddi_queryregistry_info
+  * The Microsoft documentation of the enum names D3DKMT_ADAPTERREGISTRYINFO for this type, but
