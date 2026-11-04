@@ -1,0 +1,251 @@
+Subject: [PATCH] win32u, wined3d: Report one NVIDIA driver version, 35.0.15.6094, everywhere.
+
+Forza Horizon 6 (FH205 / FH302, "Unable to detect graphics driver version") was told three
+different NVIDIA driver versions: 32.0.15.6094 by the D3DKMT queries of 0029-0031, 35.0.15.6094 by
+the DriverVersion strings win32u writes for the display adapter, 35.0.15.8180 (0x230000000f1ff4,
+"some version in the future") by the DirectX registry key's DriverVersion qword, and 31.0.15.3118
+by wined3d's D3D9 adapter identifier (and so by DXGI's CheckInterfaceSupport UMD version).
+They now all follow one number, 35.0.15.6094 = 0x00230000000F17CE packed:
+
+  * d3dkmt.c: the default of KMTQAITYPE_UMD_DRIVER_VERSION (18), KMTQAITYPE_KMD_DRIVER_VERSION (49)
+    and the QUERYREGISTRY (48) DriverVersion REG_SZ / REG_QWORD is 35.0.15.6094.
+    get_d3dkmt_driver_version() and get_d3dkmt_driver_version_packed() are now shared with
+    sysparams.c (declared in win32u_private.h).
+  * sysparams.c: the NVIDIA DriverVersion strings of the display adapter (device property and the
+    Class\{4d36e968-...}\NNNN key) come from get_d3dkmt_driver_version(), so
+    WINE_D3DKMT_DRIVER_VERSION=a.b.c.d changes them too; the DirectX key's DriverVersion qword
+    is now the packed number of that same string (for every vendor, it was a fixed 35.0.15.8180).
+    DriverDate stays the day the registry entries are written.
+  * wined3d directx.c: the driver table entry of current NVIDIA GPUs (DRIVER_NVIDIA_KEPLER) is
+    15.6094 and, on Windows 10 and later, the OS word is 35 instead of 31 (feature level word 0
+    as before), so D3D9 GetAdapterIdentifier, ddraw and DXGI's CheckInterfaceSupport answer
+    35.0.15.6094; WINE_D3DKMT_DRIVER_VERSION=a.b.c.d overrides it here too.
+Applies after 0029-0031 on CrossOver 26.3.0 sources (sources/wine).
+
+---
+diff -ruN a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+--- a/dlls/win32u/d3dkmt.c	2026-11-04 01:53:49.384375629 -0600
++++ b/dlls/win32u/d3dkmt.c	2026-11-04 01:55:41.584274372 -0600
+@@ -680,18 +680,20 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-/* Driver version reported to D3DKMTQueryAdapterInfo callers (KMTQAITYPE_UMD_DRIVER_VERSION and
+- * the "DriverVersion" value of KMTQAITYPE_QUERYREGISTRY), as the four fields a.b.c.d of a Windows
+- * display driver version.  The default is the Windows driver version of NVIDIA release 560.94
+- * (32.0.15.6094; Windows encodes NVIDIA's "xxx.yy" release as 32.0.15.xxyy).
++/* Driver version reported to D3DKMTQueryAdapterInfo callers (KMTQAITYPE_UMD_DRIVER_VERSION,
++ * KMTQAITYPE_KMD_DRIVER_VERSION and the "DriverVersion" value of KMTQAITYPE_QUERYREGISTRY), as the
++ * four fields a.b.c.d of a Windows display driver version.  The default is 35.0.15.6094, the same
++ * version sysparams.c writes to the display adapter's registry keys (the DriverVersion string of
++ * the video class key and of the device, and the DirectX key's DriverVersion qword) and the
++ * Direct3D 9 / DXGI adapter identifier of wined3d reports for NVIDIA GPUs.
+  * To change it at build time edit the defaults below; at run time set the environment variable
+- * WINE_D3DKMT_DRIVER_VERSION=a.b.c.d (e.g. 32.0.15.8180). */
+-#define D3DKMT_DRIVER_VERSION_A 32
++ * WINE_D3DKMT_DRIVER_VERSION=a.b.c.d (e.g. 35.0.15.8180), which all of those places follow. */
++#define D3DKMT_DRIVER_VERSION_A 35
+ #define D3DKMT_DRIVER_VERSION_B 0
+ #define D3DKMT_DRIVER_VERSION_C 15
+ #define D3DKMT_DRIVER_VERSION_D 6094
+ 
+-static void get_d3dkmt_driver_version( UINT16 parts[4] )
++void get_d3dkmt_driver_version( UINT16 parts[4] )
+ {
+     const char *env = getenv( "WINE_D3DKMT_DRIVER_VERSION" );
+     unsigned int a, b, c, d;
+@@ -714,7 +716,7 @@
+     parts[3] = d;
+ }
+ 
+-static UINT64 get_d3dkmt_driver_version_packed(void)
++UINT64 get_d3dkmt_driver_version_packed(void)
+ {
+     UINT16 v[4];
+     get_d3dkmt_driver_version( v );
+@@ -908,7 +910,7 @@
+     /* CW HACK 24905, extended: type 70 (D3DKMT_WDDM_2_7_CAPS) used to be answered only when
+      * CX_ACTIVE_GRAPHICS_BACKEND is "d3dmetal" and fell into "type 70 not handled" otherwise
+      * (Forza Horizon 6).  It is now answered for every backend the way the GeForce RTX 4070
+-     * (0x10de:0x2786) of a Windows 11 machine with driver 32.0.15.6094 answers: hardware GPU
++     * (0x10de:0x2786) of a Windows 11 machine with an NVIDIA driver (35.0.15.6094 here) answers: hardware GPU
+      * scheduling supported, enabled and on by default, no independent VidPn vsync control.
+      * WINE_D3DKMT_HWSCH=0 reports it as unsupported instead. */
+     case KMTQAITYPE_WDDM_2_7_CAPS:
+diff -ruN a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+--- a/dlls/win32u/sysparams.c	2026-07-15 05:37:33.000000000 -0500
++++ b/dlls/win32u/sysparams.c	2026-11-04 01:55:41.588274368 -0600
+@@ -1108,18 +1108,35 @@
+     return TRUE;
+ }
+ 
+-static const char* driver_vendor_to_version( UINT16 vendor )
++/* Fills buffer with the "a.b.c.d" driver version of a GPU vendor.  The NVIDIA one is the version
++ * D3DKMTQueryAdapterInfo reports (35.0.15.6094, or WINE_D3DKMT_DRIVER_VERSION), so that every way
++ * of asking a program has for the driver version gets the same answer. */
++static void driver_vendor_to_version( UINT16 vendor, char *buffer, size_t size )
+ {
++    UINT16 v[4];
++
+     /* The last seven digits are the driver number. */
+     switch (vendor)
+     {
+-    case 0x8086: /* Intel */    return "35.0.101.6314";
+-    case 0x1002: /* AMD */      return "35.0.21025.1024";
+-    case 0x10de: /* Nvidia */   return "35.0.15.6094";
+-    default:                    return "35.0.10.1000";
++    case 0x8086: /* Intel */    snprintf( buffer, size, "35.0.101.6314" ); break;
++    case 0x1002: /* AMD */      snprintf( buffer, size, "35.0.21025.1024" ); break;
++    case 0x10de: /* Nvidia */
++        get_d3dkmt_driver_version( v );
++        snprintf( buffer, size, "%u.%u.%u.%u", v[0], v[1], v[2], v[3] );
++        break;
++    default:                    snprintf( buffer, size, "35.0.10.1000" ); break;
+     }
+ }
+ 
++/* The same "a.b.c.d" as the 64-bit number (a << 48) | (b << 32) | (c << 16) | d. */
++static UINT64 driver_version_to_qword( const char *version )
++{
++    unsigned int a = 0, b = 0, c = 0, d = 0;
++
++    sscanf( version, "%u.%u.%u.%u", &a, &b, &c, &d );
++    return ((UINT64)(a & 0xffff) << 48) | ((UINT64)(b & 0xffff) << 32) | ((c & 0xffff) << 16) | (d & 0xffff);
++}
++
+ static const char* driver_vendor_to_name( UINT16 vendor )
+ {
+     switch (vendor)
+@@ -1472,7 +1489,7 @@
+                                    ULONGLONG memory_size )
+ {
+     unsigned int size, name_size = (wcslen( gpu->name ) + 1) * sizeof(WCHAR);
+-    char buffer[4096], *tmp;
++    char buffer[4096], *tmp, driver_version[32];
+     WCHAR bufferW[512];
+     HKEY subkey;
+     LARGE_INTEGER ft;
+@@ -1528,6 +1545,8 @@
+         NtClose( subkey );
+     }
+ 
++    driver_vendor_to_version( pci->vendor, driver_version, sizeof(driver_version) );
++
+     NtQuerySystemTime( &ft );
+     ft.QuadPart -= ft.QuadPart % 864000000000;
+     if ((subkey = reg_create_ascii_key( hkey, devpkey_device_driver_date, 0, NULL )))
+@@ -1539,7 +1558,7 @@
+     if ((subkey = reg_create_ascii_key( hkey, devpkey_device_driver_version, 0, NULL )))
+     {
+         set_reg_value( subkey, NULL, 0xffff0000 | DEVPROP_TYPE_STRING, bufferW,
+-                       asciiz_to_unicode( bufferW, driver_vendor_to_version( pci->vendor ) ));
++                       asciiz_to_unicode( bufferW, driver_version ));
+         NtClose( subkey );
+     }
+ 
+@@ -1625,7 +1644,7 @@
+     value = (ULONG)min( memory_size, (ULONGLONG)ULONG_MAX );
+     set_reg_value( hkey, memory_sizeW, REG_DWORD, &value, sizeof(value) );
+ 
+-    set_reg_ascii_value( hkey, "DriverVersion", driver_vendor_to_version( pci->vendor ) );
++    set_reg_ascii_value( hkey, "DriverVersion", driver_version );
+     NtClose( hkey );
+ 
+ 
+@@ -1636,7 +1655,7 @@
+     hkey = reg_create_ascii_key( NULL, buffer, REG_OPTION_VOLATILE, NULL );
+     if (hkey)
+     {
+-        UINT64 ver = 0x230000000f1ff4; /* Some version in the future. */
++        UINT64 ver = driver_version_to_qword( driver_version ); /* 35.0.15.6094 for NVIDIA */
+ 
+         asciiz_to_unicode( bufferW, "AdapterLuid" );
+         set_reg_value( hkey, bufferW, REG_QWORD, &gpu->luid, sizeof(gpu->luid) );
+diff -ruN a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h	2026-07-15 05:37:33.000000000 -0500
++++ b/dlls/win32u/win32u_private.h	2026-11-04 01:55:41.584274372 -0600
+@@ -194,6 +194,10 @@
+ extern void user_unlock(void);
+ extern void user_check_not_lock(void);
+ 
++/* d3dkmt.c */
++extern void get_d3dkmt_driver_version( UINT16 parts[4] );
++extern UINT64 get_d3dkmt_driver_version_packed(void);
++
+ /* d3dkmtc. */
+ 
+ struct vulkan_gpu
+diff -ruN a/dlls/wined3d/directx.c b/dlls/wined3d/directx.c
+--- a/dlls/wined3d/directx.c	2026-11-04 01:53:49.328375679 -0600
++++ b/dlls/wined3d/directx.c	2026-11-04 01:55:41.592274365 -0600
+@@ -318,7 +318,7 @@
+     {DRIVER_NVIDIA_GEFORCE6,    DRIVER_MODEL_NT6X,  "nvd3dum.dll",     13,  783},
+     {DRIVER_NVIDIA_GEFORCE8,    DRIVER_MODEL_NT6X,  "nvd3dum.dll",     13, 4052},
+     {DRIVER_NVIDIA_FERMI,       DRIVER_MODEL_NT6X,  "nvd3dum.dll",     13, 9135},
+-    {DRIVER_NVIDIA_KEPLER,      DRIVER_MODEL_NT6X,  "nvd3dum.dll",     15, 3118}, /* 531.18 */
++    {DRIVER_NVIDIA_KEPLER,      DRIVER_MODEL_NT6X,  "nvd3dum.dll",     15, 6094}, /* 35.0.15.6094 (os version, see wined3d_driver_info_init()) */
+ 
+     /* Red Hat */
+     {DRIVER_REDHAT_VIRGL,       DRIVER_MODEL_GENERIC, "virgl.dll",      0,    0},
+@@ -740,6 +740,36 @@
+     }
+ }
+ 
++/* The NVIDIA driver version win32u reports through D3DKMT and in the registry is 35.0.15.6094, or
++ * the a.b.c.d of WINE_D3DKMT_DRIVER_VERSION.  Returns false when the variable is unset or invalid. */
++static bool get_nvidia_driver_version_override(WORD parts[4])
++{
++    char env[64], *p = env;
++    unsigned int i;
++
++    if (!GetEnvironmentVariableA("WINE_D3DKMT_DRIVER_VERSION", env, sizeof(env)) || strlen(env) >= sizeof(env) - 1)
++        return false;
++
++    for (i = 0; i < 4; ++i)
++    {
++        unsigned long value = 0;
++
++        if (*p < '0' || *p > '9')
++            return false;
++        while (*p >= '0' && *p <= '9')
++        {
++            value = value * 10 + (*p++ - '0');
++            if (value > 0xffff)
++                return false;
++        }
++        if (*p != (i < 3 ? '.' : 0))
++            return false;
++        ++p;
++        parts[i] = value;
++    }
++    return true;
++}
++
+ bool wined3d_driver_info_init(struct wined3d_driver_info *driver_info,
+         const struct wined3d_gpu_description *gpu_desc, enum wined3d_feature_level feature_level,
+         UINT64 vram_bytes, UINT64 sysmem_bytes)
+@@ -922,6 +952,24 @@
+         driver_info->version_high = MAKEDWORD_VERSION(driver_os_version, driver_feature_level);
+         driver_info->version_low = MAKEDWORD_VERSION(version_info->subversion, version_info->build);
+ 
++        /* NVIDIA drivers for current GPUs report the same 35.0.15.6094 that win32u does (the
++         * D3DKMT queries and the display adapter's registry keys). */
++        if (version_info->driver == DRIVER_NVIDIA_KEPLER && driver_model == DRIVER_MODEL_NT6X
++                && driver_os_version >= 31)
++        {
++            WORD parts[4];
++
++            if (get_nvidia_driver_version_override(parts))
++            {
++                driver_info->version_high = MAKEDWORD_VERSION(parts[0], parts[1]);
++                driver_info->version_low = MAKEDWORD_VERSION(parts[2], parts[3]);
++            }
++            else
++            {
++                driver_info->version_high = MAKEDWORD_VERSION(35, 0);
++            }
++        }
++
+         return true;
+     }
+ 
